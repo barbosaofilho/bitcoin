@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 The Bitcoin Core developers
+// Copyright (c) 2015-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,42 +6,51 @@
 #define BITCOIN_TEST_UTIL_SETUP_COMMON_H
 
 #include <common/args.h> // IWYU pragma: export
+#include <consensus/amount.h>
+#include <kernel/caches.h>
 #include <key.h>
 #include <node/caches.h>
 #include <node/context.h> // IWYU pragma: export
 #include <primitives/transaction.h>
-#include <pubkey.h>
-#include <stdexcept>
+#include <random.h>
+#include <test/util/net.h>
+#include <test/util/random.h>
+#include <test/util/time.h>
 #include <util/chaintype.h> // IWYU pragma: export
-#include <util/check.h>
 #include <util/fs.h>
-#include <util/string.h>
+#include <util/signalinterrupt.h>
 #include <util/vector.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
-#include <type_traits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 class CFeeRate;
-class Chainstate;
-class FastRandomContext;
-
-/** This is connected to the logger. Can be used to redirect logs to any other log */
-extern const std::function<void(const std::string&)> G_TEST_LOG_FUN;
 
 /** Retrieve the command line arguments. */
 extern const std::function<std::vector<const char*>()> G_TEST_COMMAND_LINE_ARGUMENTS;
 
-// Enable BOOST_CHECK_EQUAL for enum class types
-namespace std {
-template <typename T>
-std::ostream& operator<<(typename std::enable_if<std::is_enum<T>::value, std::ostream>::type& stream, const T& e)
-{
-    return stream << static_cast<typename std::underlying_type<T>::type>(e);
-}
-} // namespace std
+/** Retrieve the unit test name. */
+extern const std::function<std::string()> G_TEST_GET_FULL_NAME;
 
 static constexpr CAmount CENT{1000000};
+
+/** Register common test args. Shared across binaries that rely on the test framework. */
+void SetupCommonTestArgs(ArgsManager& argsman);
+
+struct TestOpts {
+    std::vector<const char*> extra_args{};
+    bool coins_db_in_memory{true};
+    bool block_tree_db_in_memory{true};
+    bool setup_net{true};
+    bool setup_validation_interface{true};
+    bool min_validation_cache{false}; // Equivalent of -maxsigcachebytes=0
+};
 
 /** Basic testing setup.
  * This just configures logging, data dir and chain parameters.
@@ -50,10 +59,37 @@ struct BasicTestingSetup {
     util::SignalInterrupt m_interrupt;
     node::NodeContext m_node; // keep as first member to be destructed last
 
-    explicit BasicTestingSetup(const ChainType chainType = ChainType::MAIN, const std::vector<const char*>& extra_args = {});
+    FastRandomContext m_rng;
+    /** Seed the global RNG state and m_rng for testing and log the seed value. This affects all randomness, except GetStrongRandBytes(). */
+    void SeedRandomForTest(SeedRand seed)
+    {
+        SeedRandomStateForTest(seed);
+        m_rng.Reseed(GetRandHash());
+    }
+
+    explicit BasicTestingSetup(ChainType chainType = ChainType::MAIN, TestOpts = {});
     ~BasicTestingSetup();
 
-    const fs::path m_path_root;
+    fs::path m_path_root;
+    fs::path m_path_lock;
+    bool m_has_custom_datadir{false};
+    /** @brief Test-specific arguments and settings.
+     *
+     * This member is intended to be the primary source of settings for code
+     * being tested by unit tests. It exists to make tests more self-contained
+     * and reduce reliance on global state.
+     *
+     * Usage guidelines:
+     * 1. Prefer using m_args where possible in test code.
+     * 2. If m_args is not accessible, use m_node.args as a fallback.
+     * 3. Avoid direct references to gArgs in test code.
+     *
+     * Note: Currently, m_node.args points to gArgs for backwards
+     * compatibility. In the future, it will point to m_args to further isolate
+     * test environments.
+     *
+     * @see https://github.com/bitcoin/bitcoin/issues/25055 for additional context.
+     */
     ArgsManager m_args;
 };
 
@@ -62,11 +98,12 @@ struct BasicTestingSetup {
  * initialization behaviour.
  */
 struct ChainTestingSetup : public BasicTestingSetup {
-    node::CacheSizes m_cache_sizes{};
+    kernel::CacheSizes m_kernel_cache_sizes{node::CalculateCacheSizes(m_args).kernel};
     bool m_coins_db_in_memory{true};
     bool m_block_tree_db_in_memory{true};
+    std::function<void()> m_make_chainman{};
 
-    explicit ChainTestingSetup(const ChainType chainType = ChainType::MAIN, const std::vector<const char*>& extra_args = {});
+    explicit ChainTestingSetup(ChainType chainType = ChainType::MAIN, TestOpts = {});
     ~ChainTestingSetup();
 
     // Supplies a chainstate, if one is needed
@@ -77,10 +114,8 @@ struct ChainTestingSetup : public BasicTestingSetup {
  */
 struct TestingSetup : public ChainTestingSetup {
     explicit TestingSetup(
-        const ChainType chainType = ChainType::MAIN,
-        const std::vector<const char*>& extra_args = {},
-        const bool coins_db_in_memory = true,
-        const bool block_tree_db_in_memory = true);
+        ChainType chainType = ChainType::MAIN,
+        TestOpts = {});
 };
 
 /** Identical to TestingSetup, but chain set to regtest */
@@ -89,8 +124,13 @@ struct RegTestingSetup : public TestingSetup {
         : TestingSetup{ChainType::REGTEST} {}
 };
 
+/** Identical to TestingSetup, but chain set to testnet4 */
+struct Testnet4Setup : public TestingSetup {
+    Testnet4Setup()
+        : TestingSetup{ChainType::TESTNET4} {}
+};
+
 class CBlock;
-struct CMutableTransaction;
 class CScript;
 
 /**
@@ -98,19 +138,15 @@ class CScript;
  */
 struct TestChain100Setup : public TestingSetup {
     TestChain100Setup(
-        const ChainType chain_type = ChainType::REGTEST,
-        const std::vector<const char*>& extra_args = {},
-        const bool coins_db_in_memory = true,
-        const bool block_tree_db_in_memory = true);
+        ChainType chain_type = ChainType::REGTEST,
+        TestOpts = {});
 
     /**
      * Create a new block with just given transactions, coinbase paying to
      * scriptPubKey, and try to add it to the current chain.
-     * If no chainstate is specified, default to the active.
      */
     CBlock CreateAndProcessBlock(const std::vector<CMutableTransaction>& txns,
-                                 const CScript& scriptPubKey,
-                                 Chainstate* chainstate = nullptr);
+                                 const CScript& scriptPubKey);
 
     /**
      * Create a new block with just given transactions, coinbase paying to
@@ -118,8 +154,7 @@ struct TestChain100Setup : public TestingSetup {
      */
     CBlock CreateBlock(
         const std::vector<CMutableTransaction>& txns,
-        const CScript& scriptPubKey,
-        Chainstate& chainstate);
+        const CScript& scriptPubKey);
 
     //! Mine a series of new blocks on the active chain.
     void mineBlocks(int num_blocks);
@@ -193,17 +228,7 @@ struct TestChain100Setup : public TestingSetup {
      */
     std::vector<CTransactionRef> PopulateMempool(FastRandomContext& det_rand, size_t num_transactions, bool submit);
 
-    /** Mock the mempool minimum feerate by adding a transaction and calling TrimToSize(0),
-     * simulating the mempool "reaching capacity" and evicting by descendant feerate.  Note that
-     * this clears the mempool, and the new minimum feerate will depend on the maximum feerate of
-     * transactions removed, so this must be called while the mempool is empty.
-     *
-     * @param target_feerate    The new mempool minimum feerate after this function returns.
-     *                          Must be above max(incremental feerate, min relay feerate),
-     *                          or 1sat/vB with default settings.
-     */
-    void MockMempoolMinFee(const CFeeRate& target_feerate);
-
+    FakeNodeClock m_clock{std::chrono::seconds{1598887952}}; // 2020-08-31, arbitrary
     std::vector<CTransactionRef> m_coinbase_txns; // For convenience, coinbase transactions
     CKey coinbaseKey; // private/public key needed to spend coinbase transactions
 };
@@ -213,39 +238,46 @@ struct TestChain100Setup : public TestingSetup {
  * be used in "hot loops", for example fuzzing or benchmarking.
  */
 template <class T = const BasicTestingSetup>
-std::unique_ptr<T> MakeNoLogFileContext(const ChainType chain_type = ChainType::REGTEST, const std::vector<const char*>& extra_args = {})
+std::unique_ptr<T> MakeNoLogFileContext(const ChainType chain_type = ChainType::REGTEST, TestOpts opts = {})
 {
-    const std::vector<const char*> arguments = Cat(
+    opts.extra_args = Cat(
         {
             "-nodebuglogfile",
             "-nodebug",
         },
-        extra_args);
+        opts.extra_args);
 
-    return std::make_unique<T>(chain_type, arguments);
+    return std::make_unique<T>(chain_type, opts);
 }
 
-CBlock getBlock13b8a();
-
-// define an implicit conversion here so that uint256 may be used directly in BOOST_CHECK_*
-std::ostream& operator<<(std::ostream& os, const uint256& num);
-
-/**
- * BOOST_CHECK_EXCEPTION predicates to check the specific validation error.
- * Use as
- * BOOST_CHECK_EXCEPTION(code that throws, exception type, HasReason("foo"));
- */
-class HasReason
+class SocketTestingSetup : public BasicTestingSetup
 {
 public:
-    explicit HasReason(const std::string& reason) : m_reason(reason) {}
-    bool operator()(const std::exception& e) const
+    explicit SocketTestingSetup();
+    ~SocketTestingSetup();
+
+    /**
+     * Connect to the socket with a mock client and send pre-loaded data.
+     * Returns the I/O pipes from the mock client so we can read response data sent to it.
+     * Template parameter selects the socket type: DynSock by default.
+     */
+    template <typename T = DynSock>
+    std::shared_ptr<typename T::Pipes> ConnectClient(std::span<const std::byte> data)
     {
-        return std::string(e.what()).find(m_reason) != std::string::npos;
-    };
+        auto connected_socket_pipes(std::make_shared<typename T::Pipes>());
+        connected_socket_pipes->recv.PushBytes(data.data(), data.size());
+        m_accepted_sockets.Push(std::make_unique<T>(connected_socket_pipes));
+        return connected_socket_pipes;
+    }
 
 private:
-    const std::string m_reason;
+    //! Save the original value of CreateSock here and restore it when the test ends.
+    decltype(CreateSock) m_create_sock_orig;
+
+    //! Queue of connected sockets returned by listening socket (represents network interface)
+    DynSock::Queue m_accepted_sockets;
 };
+
+CBlock getBlock13b8a();
 
 #endif // BITCOIN_TEST_UTIL_SETUP_COMMON_H

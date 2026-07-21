@@ -1,10 +1,8 @@
-// Copyright (c) 2009-2022 The Bitcoin Core developers
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <arith_uint256.h>
 #include <chain.h>
@@ -12,6 +10,7 @@
 #include <chainparamsbase.h>
 #include <clientversion.h>
 #include <common/args.h>
+#include <common/license_info.h>
 #include <common/system.h>
 #include <compat/compat.h>
 #include <core_io.h>
@@ -28,7 +27,7 @@
 
 static const int CONTINUE_EXECUTION=-1;
 
-const std::function<std::string(const char*)> G_TRANSLATION_FUN = nullptr;
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 static void SetupBitcoinUtilArgs(ArgsManager &argsman)
 {
@@ -37,6 +36,7 @@ static void SetupBitcoinUtilArgs(ArgsManager &argsman)
     argsman.AddArg("-version", "Print version and exit", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
     argsman.AddCommand("grind", "Perform proof of work on hex header string");
+    argsman.AddCommand("netmagic", "Get the network magic bytes of the selected chain");
 
     SetupChainParamsBaseOptions(argsman);
 }
@@ -52,15 +52,18 @@ static int AppInitUtil(ArgsManager& args, int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    if (HelpRequested(args) || args.IsArgSet("-version")) {
+    if (HelpRequested(args) || args.GetBoolArg("-version", false)) {
         // First part of help message is specific to this utility
-        std::string strUsage = PACKAGE_NAME " bitcoin-util utility version " + FormatFullVersion() + "\n";
+        std::string strUsage = CLIENT_NAME " bitcoin-util utility version " + FormatFullVersion() + "\n";
 
-        if (args.IsArgSet("-version")) {
+        if (args.GetBoolArg("-version", false)) {
             strUsage += FormatParagraph(LicenseInfo());
         } else {
             strUsage += "\n"
-                "Usage:  bitcoin-util [options] [commands]  Do stuff\n";
+                "The bitcoin-util tool provides bitcoin related functionality that does not rely on the ability to access a running node. Available [commands] are listed below.\n"
+                "\n"
+                "Usage:  bitcoin-util [options] [command]\n"
+                "or:     bitcoin-util [options] grind <hex-block-header>\n";
             strUsage += "\n" + args.GetHelpMessage();
         }
 
@@ -148,6 +151,17 @@ static int Grind(const std::vector<std::string>& args, std::string& strPrint)
     return EXIT_SUCCESS;
 }
 
+static int NetMagic(const std::vector<std::string>& args, std::string& strPrint)
+{
+    if (!args.empty()) {
+        strPrint = "netmagic does not take arguments";
+        return EXIT_FAILURE;
+    }
+
+    strPrint = HexStr(Params().MessageStart());
+    return EXIT_SUCCESS;
+}
+
 MAIN_FUNCTION
 {
     ArgsManager& args = gArgs;
@@ -177,6 +191,8 @@ MAIN_FUNCTION
     try {
         if (cmd->command == "grind") {
             ret = Grind(cmd->args, strPrint);
+        } else if (cmd->command == "netmagic") {
+            ret = NetMagic(cmd->args, strPrint);
         } else {
             assert(false); // unknown command should be caught earlier
         }

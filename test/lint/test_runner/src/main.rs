@@ -2,99 +2,182 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+mod lint_cpp;
+mod lint_docs;
+mod lint_py;
+mod lint_repo_hygiene;
+mod lint_text_format;
+mod util;
+
 use std::env;
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
-type LintError = String;
-type LintResult = Result<(), LintError>;
-type LintFn = fn() -> LintResult;
+use lint_cpp::{
+    lint_boost_assert, lint_includes_build_config, lint_remove_all, lint_rpc_assert,
+    lint_std_filesystem,
+};
+use lint_docs::{lint_doc_args, lint_doc_release_note_snippets, lint_markdown};
+use lint_py::{lint_py_lint, lint_rmtree};
+use lint_repo_hygiene::{lint_scripted_diff, lint_subtree};
+use lint_text_format::{
+    lint_commit_msg, lint_tabs_whitespace, lint_trailing_newline, lint_trailing_whitespace,
+};
+use util::{check_output, commit_range, get_git_root, git, LintFn, LintResult};
 
-/// Return the git command
-fn git() -> Command {
-    Command::new("git")
+struct Linter {
+    pub description: &'static str,
+    pub name: &'static str,
+    pub lint_fn: LintFn,
 }
 
-/// Return stdout
-fn check_output(cmd: &mut std::process::Command) -> Result<String, LintError> {
-    let out = cmd.output().expect("command error");
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+fn get_linter_list() -> Vec<&'static Linter> {
+    vec![
+        &Linter {
+            description: "Check that all command line arguments are documented.",
+            name: "doc",
+            lint_fn: lint_doc_args
+        },
+        &Linter {
+            description: "Check that no symbol from bitcoin-build-config.h is used without the header being included",
+            name: "includes_build_config",
+            lint_fn: lint_includes_build_config
+        },
+        &Linter {
+            description: "Check that markdown links resolve",
+            name: "markdown",
+            lint_fn: lint_markdown
+        },
+        &Linter {
+            description: "Lint Python code",
+            name: "py_lint",
+            lint_fn: lint_py_lint,
+        },
+        &Linter {
+            description: "Check that shutil.rmtree is not used",
+            name: "rmtree",
+            lint_fn: lint_rmtree,
+        },
+        &Linter {
+            description: "Check that std::filesystem is not used directly",
+            name: "std_filesystem",
+            lint_fn: lint_std_filesystem
+        },
+        &Linter {
+            description: "Check that remove_all is not used",
+            name: "remove_all",
+            lint_fn: lint_remove_all
+        },
+        &Linter {
+            description: "Check that fatal assertions are not used in RPC code",
+            name: "rpc_assert",
+            lint_fn: lint_rpc_assert
+        },
+        &Linter {
+            description: "Check that boost assertions are not used",
+            name: "boost_assert",
+            lint_fn: lint_boost_assert
+        },
+        &Linter {
+            description: "Check that release note snippets are in the right folder",
+            name: "doc_release_note_snippets",
+            lint_fn: lint_doc_release_note_snippets
+        },
+        &Linter {
+            description: "Check that subtrees are pure subtrees",
+            name: "subtree",
+            lint_fn: lint_subtree
+        },
+        &Linter {
+            description: "Check scripted-diffs",
+            name: "scripted_diff",
+            lint_fn: lint_scripted_diff
+        },
+        &Linter {
+            description: "Check that commit messages have a new line before the body or no body at all.",
+            name: "commit_msg",
+            lint_fn: lint_commit_msg
+        },
+        &Linter {
+            description: "Check that tabs are not used as whitespace",
+            name: "tabs_whitespace",
+            lint_fn: lint_tabs_whitespace
+        },
+        &Linter {
+            description: "Check for trailing whitespace",
+            name: "trailing_whitespace",
+            lint_fn: lint_trailing_whitespace
+        },
+        &Linter {
+            description: "Check for trailing newline",
+            name: "trailing_newline",
+            lint_fn: lint_trailing_newline
+        },
+        &Linter {
+            description: "Run all linters of the form: test/lint/lint-*.py",
+            name: "all_python_linters",
+            lint_fn: run_all_python_linters
+        },
+    ]
+}
+
+fn print_help_and_exit() {
+    print!(
+        r#"
+Usage: test_runner [--lint=LINTER_TO_RUN]
+Runs all linters in the lint test suite, printing any errors
+they detect.
+
+If you wish to only run some particular lint tests, pass
+'--lint=' with the name of the lint test you wish to run.
+You can set as many '--lint=' values as you wish, e.g.:
+test_runner --lint=doc --lint=subtree
+
+The individual linters available to run are:
+"#
+    );
+    for linter in get_linter_list() {
+        println!("{}: \"{}\"", linter.name, linter.description)
     }
-    Ok(String::from_utf8(out.stdout)
-        .map_err(|e| format!("{e}"))?
-        .trim()
-        .to_string())
+
+    std::process::exit(1);
 }
 
-/// Return the git root as utf8, or panic
-fn get_git_root() -> PathBuf {
-    PathBuf::from(check_output(git().args(["rev-parse", "--show-toplevel"])).unwrap())
-}
+fn parse_lint_args(args: &[String]) -> Vec<&'static Linter> {
+    let linter_list = get_linter_list();
+    let mut lint_values = Vec::new();
 
-fn lint_subtree() -> LintResult {
-    // This only checks that the trees are pure subtrees, it is not doing a full
-    // check with -r to not have to fetch all the remotes.
-    let mut good = true;
-    for subtree in [
-        "src/crypto/ctaes",
-        "src/secp256k1",
-        "src/minisketch",
-        "src/leveldb",
-        "src/crc32c",
-    ] {
-        good &= Command::new("test/lint/git-subtree-check.sh")
-            .arg(subtree)
-            .status()
-            .expect("command_error")
-            .success();
+    for arg in args {
+        #[allow(clippy::if_same_then_else)]
+        if arg.starts_with("--lint=") {
+            let lint_arg_value = arg
+                .trim_start_matches("--lint=")
+                .trim_matches('"')
+                .trim_matches('\'');
+
+            let try_find_linter = linter_list
+                .iter()
+                .find(|linter| linter.name == lint_arg_value);
+            match try_find_linter {
+                Some(linter) => {
+                    lint_values.push(*linter);
+                }
+                None => {
+                    println!("No linter {lint_arg_value} found!");
+                    print_help_and_exit();
+                }
+            }
+        } else if arg.eq("--help") || arg.eq("-h") {
+            print_help_and_exit();
+        } else {
+            print_help_and_exit();
+        }
     }
-    if good {
-        Ok(())
-    } else {
-        Err("".to_string())
-    }
+
+    lint_values
 }
 
-fn lint_std_filesystem() -> LintResult {
-    let found = git()
-        .args([
-            "grep",
-            "std::filesystem",
-            "--",
-            "./src/",
-            ":(exclude)src/util/fs.h",
-        ])
-        .status()
-        .expect("command error")
-        .success();
-    if found {
-        Err(r#"
-^^^
-Direct use of std::filesystem may be dangerous and buggy. Please include <util/fs.h> and use the
-fs:: namespace, which has unsafe filesystem functions marked as deleted.
-            "#
-        .to_string())
-    } else {
-        Ok(())
-    }
-}
-
-fn lint_doc() -> LintResult {
-    if Command::new("test/lint/check-doc.py")
-        .status()
-        .expect("command error")
-        .success()
-    {
-        Ok(())
-    } else {
-        Err("".to_string())
-    }
-}
-
-fn lint_all() -> LintResult {
+fn run_all_python_linters() -> LintResult {
     let mut good = true;
     let lint_dir = get_git_root().join("test/lint");
     for entry in fs::read_dir(lint_dir).unwrap() {
@@ -109,7 +192,7 @@ fn lint_all() -> LintResult {
                 .success()
         {
             good = false;
-            println!("^---- failure generated from {}", entry_fn);
+            println!("^---- ⚠️ Failure generated from {entry_fn}");
         }
     }
     if good {
@@ -120,21 +203,29 @@ fn lint_all() -> LintResult {
 }
 
 fn main() -> ExitCode {
-    let test_list: Vec<(&str, LintFn)> = vec![
-        ("subtree check", lint_subtree),
-        ("std::filesystem check", lint_std_filesystem),
-        ("-help=1 documentation check", lint_doc),
-        ("lint-*.py scripts", lint_all),
-    ];
+    let linters_to_run: Vec<&Linter> = if env::args().count() > 1 {
+        let args: Vec<String> = env::args().skip(1).collect();
+        parse_lint_args(&args)
+    } else {
+        // If no arguments are passed, run all linters.
+        get_linter_list()
+    };
 
     let git_root = get_git_root();
+    let commit_range = commit_range();
+    let commit_log = check_output(git().args(["log", "--no-merges", "--oneline", &commit_range]))
+        .expect("check_output failed");
+    println!("Checking commit range ({commit_range}):\n{commit_log}\n");
 
     let mut test_failed = false;
-    for (lint_name, lint_fn) in test_list {
+    for linter in linters_to_run {
         // chdir to root before each lint test
         env::set_current_dir(&git_root).unwrap();
-        if let Err(err) = lint_fn() {
-            println!("{err}\n^---- Failure generated from {lint_name}!");
+        if let Err(err) = (linter.lint_fn)() {
+            println!(
+                "^^^\n{err}\n^---- ⚠️ Failure generated from lint check '{}' ({})!\n\n",
+                linter.name, linter.description,
+            );
             test_failed = true;
         }
     }

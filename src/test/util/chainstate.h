@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 The Bitcoin Core developers
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 //
@@ -6,12 +6,13 @@
 #define BITCOIN_TEST_UTIL_CHAINSTATE_H
 
 #include <clientversion.h>
-#include <logging.h>
 #include <node/context.h>
 #include <node/utxo_snapshot.h>
 #include <rpc/blockchain.h>
 #include <test/util/setup_common.h>
+#include <util/byte_units.h>
 #include <util/fs.h>
+#include <util/log.h>
 #include <validation.h>
 
 #include <univalue.h>
@@ -47,16 +48,19 @@ CreateAndActivateUTXOSnapshot(
     FILE* outfile{fsbridge::fopen(snapshot_path, "wb")};
     AutoFile auto_outfile{outfile};
 
-    UniValue result = CreateUTXOSnapshot(
-        node, node.chainman->ActiveChainstate(), auto_outfile, snapshot_path, snapshot_path);
-    LogPrintf(
-        "Wrote UTXO snapshot to %s: %s\n", fs::PathToString(snapshot_path.make_preferred()), result.write());
+    UniValue result = CreateUTXOSnapshot(node,
+                                         node.chainman->ActiveChainstate(),
+                                         std::move(auto_outfile), // Will close auto_outfile.
+                                         snapshot_path,
+                                         snapshot_path);
+    LogInfo("Wrote UTXO snapshot to %s: %s",
+            fs::PathToString(snapshot_path.make_preferred()), result.write());
 
     // Read the written snapshot in and then activate it.
     //
     FILE* infile{fsbridge::fopen(snapshot_path, "rb")};
     AutoFile auto_infile{infile};
-    node::SnapshotMetadata metadata;
+    node::SnapshotMetadata metadata{node.chainman->GetParams().MessageStart()};
     auto_infile >> metadata;
 
     malleation(auto_infile, metadata);
@@ -76,12 +80,11 @@ CreateAndActivateUTXOSnapshot(
             node.chainman->ResetChainstates();
             node.chainman->InitializeChainstate(node.mempool.get());
             Chainstate& chain = node.chainman->ActiveChainstate();
-            Assert(chain.LoadGenesisBlock());
+            Assert(node.chainman->LoadGenesisBlock());
             // These cache values will be corrected shortly in `MaybeRebalanceCaches`.
-            chain.InitCoinsDB(1 << 20, true, false, "");
-            chain.InitCoinsCache(1 << 20);
+            chain.InitCoinsDB(1_MiB, /*in_memory=*/true, /*should_wipe=*/false);
+            chain.InitCoinsCache(1_MiB);
             chain.CoinsTip().SetBestBlock(gen_hash);
-            chain.setBlockIndexCandidates.insert(node.chainman->m_blockman.LookupBlockIndex(gen_hash));
             chain.LoadChainTip();
             node.chainman->MaybeRebalanceCaches();
 
@@ -91,15 +94,19 @@ CreateAndActivateUTXOSnapshot(
             // these blocks instead
             CBlockIndex *pindex = orig_tip;
             while (pindex && pindex != chain.m_chain.Tip()) {
-                pindex->nStatus &= ~BLOCK_HAVE_DATA;
-                pindex->nStatus &= ~BLOCK_HAVE_UNDO;
-                // We have to set the ASSUMED_VALID flag, because otherwise it
-                // would not be possible to have a block index entry without HAVE_DATA
-                // and with nTx > 0 (since we aren't setting the pruned flag);
-                // see CheckBlockIndex().
-                pindex->nStatus |= BLOCK_ASSUMED_VALID;
+                // Remove all data and validity flags by just setting
+                // BLOCK_VALID_TREE. Also reset transaction counts and sequence
+                // ids that are set when blocks are received, to make test setup
+                // more realistic and satisfy consistency checks in
+                // CheckBlockIndex().
+                assert(pindex->IsValid(BlockStatus::BLOCK_VALID_TREE));
+                pindex->nStatus = BlockStatus::BLOCK_VALID_TREE;
+                pindex->nTx = 0;
+                pindex->m_chain_tx_count = 0;
+                pindex->nSequenceId = 0;
                 pindex = pindex->pprev;
             }
+            chain.PopulateBlockIndexCandidates();
         }
         BlockValidationState state;
         if (!node.chainman->ActiveChainstate().ActivateBestChain(state)) {
@@ -121,11 +128,11 @@ CreateAndActivateUTXOSnapshot(
         new_active.m_chain.SetTip(*(tip->pprev));
     }
 
-    bool res = node.chainman->ActivateSnapshot(auto_infile, metadata, in_memory_chainstate);
+    auto res = node.chainman->ActivateSnapshot(auto_infile, metadata, in_memory_chainstate);
 
     // Restore the old tip.
     new_active.m_chain.SetTip(*tip);
-    return res;
+    return !!res;
 }
 
 

@@ -1,12 +1,20 @@
-// Copyright (c) 2023 The Bitcoin Core developers
+// Copyright (c) 2023-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
 #include <kernel/disconnected_transactions.h>
 #include <primitives/block.h>
-#include <test/util/random.h>
+#include <primitives/transaction.h>
+#include <script/script.h>
 #include <test/util/setup_common.h>
+#include <util/check.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <vector>
 
 constexpr size_t BLOCK_VTX_COUNT{4000};
 constexpr size_t BLOCK_VTX_COUNT_10PERCENT{400};
@@ -125,6 +133,6 @@ static void AddAndRemoveDisconnectedBlockTransactions10(benchmark::Bench& bench)
     });
 }
 
-BENCHMARK(AddAndRemoveDisconnectedBlockTransactionsAll, benchmark::PriorityLevel::HIGH);
-BENCHMARK(AddAndRemoveDisconnectedBlockTransactions90, benchmark::PriorityLevel::HIGH);
-BENCHMARK(AddAndRemoveDisconnectedBlockTransactions10, benchmark::PriorityLevel::HIGH);
+BENCHMARK(AddAndRemoveDisconnectedBlockTransactionsAll);
+BENCHMARK(AddAndRemoveDisconnectedBlockTransactions90);
+BENCHMARK(AddAndRemoveDisconnectedBlockTransactions10);
