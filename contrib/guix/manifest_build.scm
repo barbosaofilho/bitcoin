@@ -8,13 +8,11 @@
              ((gnu packages linux) #:select (linux-libre-headers-6.1))
              (gnu packages llvm)
              (gnu packages mingw)
-             ((gnu packages python) #:select (python-minimal))
              ((gnu packages version-control) #:select (git-minimal))
              (guix build-system trivial)
              (guix download)
              (guix gexp)
              (guix git-download)
-             ((guix licenses) #:prefix license:)
              (guix packages)
              ((guix utils) #:select (substitute-keyword-arguments)))
 
@@ -129,13 +127,41 @@ desirable for building Bitcoin Core release binaries."
   (package-with-extra-patches mingw-w64-x86_64-winpthreads
     (search-our-patches "winpthreads-remap-guix-store.patch")))
 
+(define (mingw-force-ucrt mingw)
+  (package
+    (inherit mingw) ;; 13.0.0
+    (name (string-append (package-name mingw) "-ucrt"))
+    (arguments
+     (substitute-keyword-arguments (package-arguments mingw)
+       ((#:configure-flags flags)
+        #~(map (lambda (flag)
+                 (if (string-prefix? "--with-default-msvcrt" flag)
+                     "--with-default-msvcrt=ucrt"
+                     flag))
+               #$flags))))))
+
+(define (make-mingw-w64-ucrt machine xgcc)
+  "Return a UCRT variant of mingw-w64 for targeting MACHINE using XGCC cross-compiler."
+  (let ((base-mingw-winpthreads
+         (make-mingw-w64 machine
+                         #:xgcc xgcc
+                         #:with-winpthreads? #t))
+        (base-mingw-sans-winpthreads
+         (make-mingw-w64 machine
+                         #:xgcc xgcc)))
+    (mingw-force-ucrt
+     (package
+       (inherit base-mingw-winpthreads)
+       (native-inputs
+        (modify-inputs (package-native-inputs base-mingw-winpthreads)
+          (replace "xlibc" (mingw-force-ucrt base-mingw-sans-winpthreads))))))))
+
 (define (make-mingw-pthreads-cross-toolchain target)
   "Create a cross-compilation toolchain package for TARGET"
   (let* ((xbinutils (binutils-mingw-patches (base-binutils target)))
          (machine (substring target 0 (string-index target #\-)))
-         (pthreads-xlibc (winpthreads-patches (make-mingw-w64 machine
-                                         #:xgcc (cross-gcc target #:xgcc base-gcc)
-                                         #:with-winpthreads? #t)))
+         (pthreads-xlibc (winpthreads-patches (make-mingw-w64-ucrt machine
+                                                                   (cross-gcc target #:xgcc base-gcc))))
          (pthreads-xgcc (cross-gcc target
                                     #:xgcc mingw-w64-base-gcc
                                     #:xbinutils xbinutils
@@ -234,12 +260,13 @@ chain for " target " development."))
         ((#:configure-flags flags)
           `(append ,flags
             ;; https://www.gnu.org/software/libc/manual/html_node/Configuring-and-compiling.html
-            (list "--enable-stack-protector=all",
+            (list "--enable-bind-now",
                   "--enable-cet",
-                  "--enable-bind-now",
-                  "--disable-werror",
-                  "--disable-timezone-tools",
+                  "--enable-kernel=3.17.0",
+                  "--enable-stack-protector=all",
                   "--disable-profile",
+                  "--disable-timezone-tools",
+                  "--disable-werror",
                   building-on)))
     ((#:phases phases)
         `(modify-phases ,phases
@@ -273,8 +300,6 @@ chain for " target " development."))
         ;; Build tools
         cmake-minimal
         gnu-make
-        ;; Scripting
-        python-minimal ;; (3.11)
         ;; Git
         git-minimal)
   (let ((target (getenv "HOST")))
