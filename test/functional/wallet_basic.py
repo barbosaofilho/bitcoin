@@ -8,10 +8,8 @@ from itertools import product
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.descriptors import descsum_create
-from test_framework.messages import (
-    COIN,
-    DEFAULT_ANCESTOR_LIMIT,
-)
+from test_framework.mempool_util import DEFAULT_ANCESTOR_LIMIT
+from test_framework.messages import COIN
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_array_result,
@@ -29,8 +27,7 @@ OUT_OF_RANGE = "Amount out of range"
 class WalletTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 4
-        # whitelist peers to speed up tx relay / mempool sync
-        self.noban_tx_relay = True
+        self.noban_tx_relay = True  # faster tx relay
         self.extra_args = [[
             "-dustrelayfee=0", "-walletrejectlongchains=0"
         ]] * self.num_nodes

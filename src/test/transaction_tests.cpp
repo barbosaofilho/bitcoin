@@ -399,19 +399,15 @@ BOOST_AUTO_TEST_CASE(test_Get)
         SetupDummyInputs(keystore, coins, {11*CENT, 50*CENT, 21*CENT, 22*CENT});
 
     CMutableTransaction t1;
-    t1.vin.resize(3);
-    t1.vin[0].prevout.hash = dummyTransactions[0].GetHash();
-    t1.vin[0].prevout.n = 1;
-    t1.vin[0].scriptSig << std::vector<unsigned char>(65, 0);
-    t1.vin[1].prevout.hash = dummyTransactions[1].GetHash();
-    t1.vin[1].prevout.n = 0;
-    t1.vin[1].scriptSig << std::vector<unsigned char>(65, 0) << std::vector<unsigned char>(33, 4);
-    t1.vin[2].prevout.hash = dummyTransactions[1].GetHash();
-    t1.vin[2].prevout.n = 1;
-    t1.vin[2].scriptSig << std::vector<unsigned char>(65, 0) << std::vector<unsigned char>(33, 4);
-    t1.vout.resize(2);
-    t1.vout[0].nValue = 90*CENT;
-    t1.vout[0].scriptPubKey << OP_1;
+    t1.vin = {
+        CTxIn{COutPoint{dummyTransactions[0].GetHash(), 1}, CScript{} << std::vector<unsigned char>(65, 0)},
+        CTxIn{COutPoint{dummyTransactions[1].GetHash(), 0}, CScript{} << std::vector<unsigned char>(65, 0) << std::vector<unsigned char>(33, 4)},
+        CTxIn{COutPoint{dummyTransactions[1].GetHash(), 1}, CScript{} << std::vector<unsigned char>(65, 0) << std::vector<unsigned char>(33, 4)},
+    };
+    t1.vout = {
+        CTxOut{90 * CENT, CScript{} << OP_1},
+        CTxOut{},
+    };
 
     BOOST_CHECK(ValidateInputsStandardness(CTransaction(t1), coins).IsValid());
 }
@@ -1392,6 +1388,32 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
         tx_spend.vin[0].scriptSig.clear();
         BOOST_CHECK(!::SpendsNonAnchorWitnessProg(CTransaction{tx_spend}, coins));
     }
+}
+
+BOOST_AUTO_TEST_CASE(tx_malformed_serialization)
+{
+    // A transaction with one input, one output and a one-element witness.
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].scriptWitness.stack = {{0xaa}};
+    mtx.vout.emplace_back(1, CScript{} << OP_TRUE);
+    DataStream ser;
+    ser << TX_WITH_WITNESS(mtx);
+
+    CMutableTransaction tx;
+    DataStream{std::span{ser}} >> TX_WITH_WITNESS(tx);
+    BOOST_CHECK(CTransaction{tx}.HasWitness());
+
+    // Every strict prefix ends inside some field, such as a CompactSize, an output
+    // script, a witness element or the locktime, and fails to deserialize.
+    for (size_t len{0}; len < ser.size(); ++len) {
+        BOOST_CHECK_EXCEPTION(DataStream{std::span{ser}.first(len)} >> TX_WITH_WITNESS(tx), std::ios_base::failure, HasReason{"end of data"});
+    }
+
+    // A flag other than 1 is unknown, including one without the witness bit.
+    DataStream bad_flag;
+    bad_flag << mtx.version << uint8_t{0x00} << uint8_t{0x02} << mtx.vin << mtx.vout << mtx.vin[0].scriptWitness.stack << mtx.nLockTime;
+    BOOST_CHECK_EXCEPTION(bad_flag >> TX_WITH_WITNESS(tx), std::ios_base::failure, HasReason{"Unknown transaction optional data"});
 }
 
 BOOST_AUTO_TEST_SUITE_END()
